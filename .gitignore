@@ -5,6 +5,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -30,3 +31,18 @@ models/
 
 # Logs
 *.log
+
+# Audio artifacts (downloaded inputs / normalized WAVs / local test clips)
+*.wav
+*.flac
+*.mp3
+*.m4a
+
+# Benchmark — local audio + references + run outputs (SPEC §10.4): may contain
+# real customer audio; never commit. Keep the directories (via .gitkeep) but
+# ignore their contents.
+benchmark/datasets/*
+benchmark/results/*
+!benchmark/datasets/.gitkeep
+!benchmark/results/.gitkeep
+!benchmark/datasets/README.md

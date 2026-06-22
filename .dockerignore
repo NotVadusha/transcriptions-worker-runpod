@@ -1,0 +1,56 @@
+# Keep the build context small and the image clean. The Dockerfile only COPYs
+# requirements.txt, scripts/prefetch_model.py, src/, and tests/test_input.json —
+# everything else is excluded.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Python caches / build artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Tests (the build only needs tests/test_input.json, COPYed explicitly).
+# Exclude the rest of the test suite from the image.
+tests/test_*.py
+tests/__init__.py
+tests/__pycache__/
+
+# Benchmark harness + (gitignored) datasets/results — never in the worker image.
+benchmark/datasets/
+benchmark/results/
+benchmark/
+
+# Docs / project meta not needed at runtime
+README.md
+*.md
+pyproject.toml
+
+# Local audio / model scratch files
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.mp4
+*.ogg
+*.opus
+
+# Editor / OS cruft
+.idea/
+.vscode/
+.DS_Store

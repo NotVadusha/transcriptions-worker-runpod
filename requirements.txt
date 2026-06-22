@@ -1,1 +1,11 @@
+# Worker image dependencies — ONLY what the NeMo NGC base image lacks.
+#
+# torch, nemo_toolkit, CUDA, libsndfile, numpy, etc. are ALL provided by the
+# base image (nvcr.io/nvidia/nemo:25.09.02 — see Dockerfile). Do NOT pin or
+# reinstall torch/nemo here: that risks breaking the GPU-matched build the NeMo
+# image ships (Blackwell/Hopper compute capability + CUDA 12.9 + torch 2.8).
+#
+# whisper / assemblyai are benchmark-only and are NOT installed in the worker
+# image — keep them out of here.
 runpod>=1.6.0
+httpx>=0.27

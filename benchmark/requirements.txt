@@ -1,0 +1,34 @@
+# Benchmark-only dependencies (SPEC §10).
+#
+# These are NOT part of the worker image (src/requirements.txt) — Whisper and
+# AssemblyAI live in the benchmark only and must never become worker deps.
+# Install into a separate environment:
+#
+#     python -m venv .venv-bench && source .venv-bench/bin/activate
+#     pip install -r benchmark/requirements.txt
+#
+# Every system degrades gracefully: if a package or API key is missing, that
+# system is skipped and rows are still emitted for the others. So you can install
+# a subset (e.g. drop the Whisper line if you only want Parakeet vs AssemblyAI).
+
+# WER (raw + normalized). metrics.py falls back to a stdlib WER if absent,
+# but jiwer is the reference implementation used for the reported numbers.
+jiwer>=3.0
+
+# Whisper large-v3 control baseline. faster-whisper (CTranslate2) is preferred
+# for speed; openai-whisper is the documented fallback. Install ONE of them.
+faster-whisper>=1.0
+# openai-whisper>=20231117
+
+# AssemblyAI incumbent. Needs ASSEMBLYAI_API_KEY in the environment.
+assemblyai>=0.30
+
+# Parakeet RunPod-endpoint backend HTTP client. (Also used by the worker image,
+# but pinned here too so the benchmark env is self-contained.)
+httpx>=0.27
+
+# Tabular handling / convenience for analyzing results CSVs.
+pandas>=2.0
+
+# Reference-audio IO if you need to inspect/convert WAVs in notebooks.
+soundfile>=0.12
