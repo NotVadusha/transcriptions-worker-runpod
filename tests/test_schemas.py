@@ -235,6 +235,16 @@ def test_build_output_propagates_chunked_meta():
     assert out["meta"]["num_chunks"] == 5
 
 
+def test_build_output_propagates_gap_retry_meta():
+    result = _sample_result()
+    result["gap_retry_count"] = 2
+    result["gap_retry_recovered"] = 1
+    req = Request("https://x.com/a.wav", True, "en", None)
+    out = build_output(result, duration=3600.0, processing_time=200.0, req=req)
+    assert out["meta"]["gap_retry_count"] == 2
+    assert out["meta"]["gap_retry_recovered"] == 1
+
+
 def test_build_output_duration_rounding():
     req = Request("https://x.com/a.wav", True, "en", None)
     out = build_output(

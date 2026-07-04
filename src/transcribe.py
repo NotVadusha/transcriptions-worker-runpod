@@ -250,6 +250,113 @@ def _map_segments(segment_stamps) -> list[dict]:
     return segments
 
 
+def _text_from_items(segments: list[dict], words: list[dict]) -> str:
+    """Build transcript text from sorted segments, falling back to words."""
+    if segments:
+        return " ".join(" ".join(seg["text"] for seg in segments).split())
+    return " ".join(" ".join(word["word"] for word in words).split())
+
+
+def _find_internal_gaps(items: list[dict]) -> list[tuple[float, float]]:
+    """Return suspicious internal transcript gaps as ``(start, end)`` pairs."""
+    if len(items) < 2 or not config.GAP_RETRY_ENABLED:
+        return []
+
+    gaps: list[tuple[float, float]] = []
+    ordered = sorted(items, key=lambda item: (item["start"], item["end"]))
+    prev_end = float(ordered[0]["end"])
+    for item in ordered[1:]:
+        start = float(item["start"])
+        if start - prev_end >= config.GAP_RETRY_MIN_SEC:
+            gaps.append((prev_end, start))
+        prev_end = max(prev_end, float(item["end"]))
+    return gaps
+
+
+def _items_in_window(items: list[dict], start: float, end: float) -> list[dict]:
+    """Keep items whose center lies in ``[start, end]``."""
+    kept: list[dict] = []
+    for item in items:
+        center = (item["start"] + item["end"]) / 2.0
+        if start <= center <= end:
+            kept.append(item)
+    return kept
+
+
+def _merge_items(base: list[dict], extra: list[dict]) -> list[dict]:
+    """Merge timestamped items in timeline order."""
+    merged = list(base) + list(extra)
+    merged.sort(key=lambda item: (item["start"], item["end"]))
+    return merged
+
+
+def _retry_internal_gaps(
+    wav_path: str, duration: float, work_dir: str, merged: dict
+) -> dict:
+    """Retry large internal gaps and splice recovered text into ``merged``."""
+    gap_items = merged["words"] or merged["segments"]
+    gaps = _find_internal_gaps(gap_items)
+    if not gaps:
+        return {**merged, "gap_retry_count": 0, "gap_retry_recovered": 0}
+
+    retry_words: list[dict] = []
+    retry_segments: list[dict] = []
+    attempted = 0
+    recovered = 0
+
+    for index, (gap_start, gap_end) in enumerate(gaps):
+        retry_start = max(0.0, gap_start - config.GAP_RETRY_PADDING_SEC)
+        retry_end = min(duration, gap_end + config.GAP_RETRY_PADDING_SEC)
+        retry_duration = retry_end - retry_start
+        if retry_duration <= 0 or retry_duration > config.GAP_RETRY_MAX_SEC:
+            continue
+
+        attempted += 1
+        retry_path = os.path.join(work_dir, f"gap_retry_{index:04d}.wav")
+        try:
+            audio.extract_window(wav_path, retry_start, retry_duration, retry_path)
+            _set_attention("global")
+            _, words, segments = _transcribe_one(retry_path)
+        except TranscriptionError:
+            raise
+        except Exception as exc:
+            raise TranscriptionError(
+                f"gap retry {index} transcription failed: {exc}"
+            ) from exc
+        finally:
+            try:
+                os.remove(retry_path)
+            except OSError:
+                pass
+
+        abs_words = chunking.offset_items(words, retry_start)
+        abs_segments = chunking.offset_items(segments, retry_start)
+        core_words = _items_in_window(abs_words, gap_start, gap_end)
+        core_segments = _items_in_window(abs_segments, gap_start, gap_end)
+        if core_words and not core_segments:
+            core_segments = [
+                {
+                    "start": core_words[0]["start"],
+                    "end": core_words[-1]["end"],
+                    "text": _text_from_items([], core_words),
+                }
+            ]
+        if core_words or core_segments:
+            recovered += 1
+            retry_words.extend(core_words)
+            retry_segments.extend(core_segments)
+
+    words = _merge_items(merged["words"], retry_words)
+    segments = _merge_items(merged["segments"], retry_segments)
+    return {
+        "text": _text_from_items(segments, words),
+        "words": words,
+        "segments": segments,
+        "gap_retry_count": attempted,
+        "gap_retry_recovered": recovered,
+    }
+
+
 def _transcribe_one(wav_path: str) -> tuple[str, list[dict], list[dict]]:
     """Transcribe a single wav file, returning (text, words, segments).
 
@@ -289,9 +396,11 @@ def run(wav_path: str, duration: float, return_timestamps: bool) -> dict:
     Path selection (SPEC §5):
       * ``duration <= config.SINGLE_PASS_MAX_SEC`` -> single pass with global
         attention.
-      * otherwise -> chunked path: local attention (applied once) + overlapping
-        windows extracted with ffmpeg, each transcribed with chunk-local
-        timestamps, then stitched to absolute time via ``chunking.stitch``.
+      * otherwise -> chunked path: global attention for manageable chunks, or
+        local attention for larger chunks, plus overlapping windows extracted
+        with ffmpeg, each transcribed with chunk-local timestamps, then stitched
+        to absolute time via ``chunking.stitch``. Large internal gaps are
+        retried with a padded extraction window.
 
     ``return_timestamps`` does NOT change whether we ask NeMo for timestamps —
     we always do (the chunked path needs them for overlap dedup, and they are
@@ -325,9 +434,15 @@ def run(wav_path: str, duration: float, return_timestamps: bool) -> dict:
         }
 
     # ------------------------------- chunked ----------------------------- #
-    # Local attention + conv chunking, applied ONCE before the loop (RESEARCH.md
-    # §3 PATH A). This bounds per-chunk VRAM for long audio.
-    _set_attention("local")
+    # Shorter chunks can keep the model's global attention, which is more
+    # accurate. Local attention remains available for very large chunk windows.
+    chunk_attention = "local"
+    if (
+        config.TRANSCRIPTION_QUALITY != "fast"
+        and config.CHUNK_SEC <= config.SINGLE_PASS_MAX_SEC
+    ):
+        chunk_attention = "global"
+    _set_attention(chunk_attention)
 
     plans = chunking.plan_chunks(duration, config.CHUNK_SEC, config.CHUNK_OVERLAP_SEC)
     work_dir = os.path.dirname(os.path.abspath(wav_path))
@@ -364,10 +479,13 @@ def run(wav_path: str, duration: float, return_timestamps: bool) -> dict:
                 pass
 
     merged = chunking.stitch(chunk_outputs)
+    merged = _retry_internal_gaps(wav_path, duration, work_dir, merged)
     return {
         "text": merged["text"],
         "words": merged["words"],
         "segments": merged["segments"],
         "chunked": True,
         "num_chunks": len(plans),
+        "gap_retry_count": merged["gap_retry_count"],
+        "gap_retry_recovered": merged["gap_retry_recovered"],
     }

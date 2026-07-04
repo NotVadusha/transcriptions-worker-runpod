@@ -147,5 +147,10 @@ def build_output(
         "num_chunks": result["num_chunks"],
         "worker_version": config.WORKER_VERSION,
     }
+    if "gap_retry_count" in result:
+        output["meta"]["gap_retry_count"] = result["gap_retry_count"]
+        output["meta"]["gap_retry_recovered"] = result.get(
+            "gap_retry_recovered", 0
+        )
 
     return output

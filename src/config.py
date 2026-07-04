@@ -77,6 +77,29 @@ def _get_bool(name: str, default: bool) -> bool:
 # Model / language
 # --------------------------------------------------------------------------- #
 MODEL_NAME: str = _get_str("MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
+TRANSCRIPTION_QUALITY: str = _get_str("TRANSCRIPTION_QUALITY", "balanced").lower()
+if TRANSCRIPTION_QUALITY not in ("fast", "balanced", "best"):
+    raise ValueError(
+        "TRANSCRIPTION_QUALITY must be one of: 'fast', 'balanced', 'best'."
+    )
+
+_QUALITY_DEFAULTS = {
+    "fast": {
+        "chunk_sec": 1200,
+        "chunk_overlap_sec": 15,
+        "gap_retry_enabled": False,
+    },
+    "balanced": {
+        "chunk_sec": 300,
+        "chunk_overlap_sec": 20,
+        "gap_retry_enabled": True,
+    },
+    "best": {
+        "chunk_sec": 180,
+        "chunk_overlap_sec": 30,
+        "gap_retry_enabled": True,
+    },
+}[TRANSCRIPTION_QUALITY]
 
 DEFAULT_LANGUAGE: str = "en"
 SUPPORTED_LANGUAGES: frozenset = frozenset({"en"})
@@ -86,8 +109,16 @@ SUPPORTED_LANGUAGES: frozenset = frozenset({"en"})
 # --------------------------------------------------------------------------- #
 MAX_AUDIO_SECONDS: int = _get_int("MAX_AUDIO_SECONDS", 36000)
 SINGLE_PASS_MAX_SEC: int = _get_int("SINGLE_PASS_MAX_SEC", 1440)
-CHUNK_SEC: int = _get_int("CHUNK_SEC", 1200)
-CHUNK_OVERLAP_SEC: int = _get_int("CHUNK_OVERLAP_SEC", 15)
+CHUNK_SEC: int = _get_int("CHUNK_SEC", _QUALITY_DEFAULTS["chunk_sec"])
+CHUNK_OVERLAP_SEC: int = _get_int(
+    "CHUNK_OVERLAP_SEC", _QUALITY_DEFAULTS["chunk_overlap_sec"]
+)
+GAP_RETRY_MIN_SEC: int = _get_int("GAP_RETRY_MIN_SEC", 20)
+GAP_RETRY_PADDING_SEC: int = _get_int("GAP_RETRY_PADDING_SEC", 5)
+GAP_RETRY_MAX_SEC: int = _get_int("GAP_RETRY_MAX_SEC", 300)
+GAP_RETRY_ENABLED: bool = _get_bool(
+    "GAP_RETRY_ENABLED", _QUALITY_DEFAULTS["gap_retry_enabled"]
+)
 
 # --------------------------------------------------------------------------- #
 # Download limits
@@ -131,6 +162,12 @@ if CHUNK_OVERLAP_SEC >= CHUNK_SEC:
     raise ValueError(
         f"CHUNK_OVERLAP_SEC ({CHUNK_OVERLAP_SEC}) must be < "
         f"CHUNK_SEC ({CHUNK_SEC})."
+    )
+
+if GAP_RETRY_PADDING_SEC * 2 >= GAP_RETRY_MAX_SEC:
+    raise ValueError(
+        f"GAP_RETRY_PADDING_SEC ({GAP_RETRY_PADDING_SEC}) must leave a "
+        f"positive retry core inside GAP_RETRY_MAX_SEC ({GAP_RETRY_MAX_SEC})."
     )
 
 

@@ -411,15 +411,23 @@ Genuinely unexpected failures (e.g. CUDA OOM, model load failure → `Transcript
 
 - **Short path** (`duration <= SINGLE_PASS_MAX_SEC`, default 1440 s / 24 min): one
   `transcribe([wav], timestamps=True)` call with the model's default global attention.
-- **Long path** (`duration > SINGLE_PASS_MAX_SEC`): switch the encoder to local windowed attention
-  once (`rel_pos_local_attn [128,128]` + conv-chunking factor — cuts VRAM), split the WAV into
-  overlapping windows (`CHUNK_SEC` with `CHUNK_OVERLAP_SEC` overlap), transcribe each, then stitch.
+- **Long path** (`duration > SINGLE_PASS_MAX_SEC`): split the WAV into overlapping windows
+  (`CHUNK_SEC` with `CHUNK_OVERLAP_SEC` overlap), transcribe each, then stitch. Chunks whose
+  length is at or below `SINGLE_PASS_MAX_SEC` use the model's default global attention for better
+  accuracy in `balanced`/`best` mode. `fast` mode, and larger chunk windows, use local windowed
+  attention (`rel_pos_local_attn [128,128]` + conv-chunking factor) to bound VRAM.
 
 **Stitching / dedup rule** (unit-tested in `tests/test_chunking.py`): each chunk's chunk-local
 timestamps are offset to absolute time by its start; in the overlap region between chunks, a token
 is kept by whichever chunk **owns** that time, where ownership boundaries are the midpoints of the
 overlap regions. A token is kept by chunk *i* iff its center `(start+end)/2` falls in chunk *i*'s
 ownership window. This guarantees no dropped or doubled words at seams.
+
+After stitching, the worker scans for large internal transcript gaps. If a gap is at least
+`GAP_RETRY_MIN_SEC`, it extracts that interval with `GAP_RETRY_PADDING_SEC` of context on both
+sides, retranscribes it with global attention, and splices only tokens whose centers fall inside
+the original missing interval. The response `meta` includes `gap_retry_count` and
+`gap_retry_recovered` for chunked runs.
 
 ---
 
@@ -431,10 +439,15 @@ immediately (fail fast).
 | Var | Default | Meaning |
 |---|---|---|
 | `MODEL_NAME` | `nvidia/parakeet-tdt-0.6b-v2` | Model to load. Only v2 is validated in v0. |
+| `TRANSCRIPTION_QUALITY` | `balanced` | Preset for long-audio quality/speed. `fast` = old 20-min local-attention chunks, no gap retry. `balanced` = 5-min global-attention chunks + gap retry. `best` = 3-min global-attention chunks + gap retry. Explicit chunk/retry env vars override the preset defaults. |
 | `MAX_AUDIO_SECONDS` | `36000` | Reject audio longer than this (10 h) → `AUDIO_TOO_LONG`. |
 | `SINGLE_PASS_MAX_SEC` | `1440` | `<=` this → single-pass; above → chunked (24 min). |
-| `CHUNK_SEC` | `1200` | Chunk length for the long-audio path (20 min). |
-| `CHUNK_OVERLAP_SEC` | `15` | Overlap between chunks (avoids clipping words at seams). |
+| `CHUNK_SEC` | `300` in `balanced` | Chunk length for the long-audio path. |
+| `CHUNK_OVERLAP_SEC` | `20` in `balanced` | Overlap between chunks (avoids clipping words at seams). |
+| `GAP_RETRY_ENABLED` | `true` in `balanced`/`best` | Retry large internal transcript gaps after initial stitching. |
+| `GAP_RETRY_MIN_SEC` | `20` | Minimum timestamp gap that triggers a retry. |
+| `GAP_RETRY_PADDING_SEC` | `5` | Seconds of context added before/after each retried gap. |
+| `GAP_RETRY_MAX_SEC` | `300` | Skip retry windows larger than this to avoid runaway recovery jobs. |
 | `DOWNLOAD_TIMEOUT_SEC` | `120` | Per-download timeout. |
 | `MAX_DOWNLOAD_BYTES` | `2147483648` | Max audio download size (2 GB) → `DOWNLOAD_FAILED` if exceeded. |
 | `RESULT_OFFLOAD_THRESHOLD_BYTES` | `8000000` | Offload result above ~8 MB (under the 10 MB `/run` cap). |
