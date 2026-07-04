@@ -21,13 +21,14 @@ GET URL and, for large results, PUTs them to a caller-provided presigned PUT URL
 transcriptions-worker-runpod/
 ├── README.md                  # this file
 ├── Dockerfile                 # worker image (NeMo base + ffmpeg + runpod)
+├── handler.py                 # repository-root RunPod entrypoint wrapper
 ├── requirements.txt           # only what the NeMo base image lacks
 ├── pyproject.toml             # pytest config (pythonpath = ["."])
 ├── .dockerignore
 ├── .gitignore
 ├── src/
 │   ├── __init__.py            # makes `from src import ...` work
-│   ├── handler.py             # RunPod entrypoint: runpod.serverless.start(...)
+│   ├── handler.py             # worker orchestration implementation
 │   ├── transcribe.py          # NeMo model load + transcription (single-pass & chunked)
 │   ├── audio.py               # download + ffmpeg normalize + ffprobe duration
 │   ├── chunking.py            # long-audio segmentation + timestamp stitching (pure logic)
@@ -48,7 +49,8 @@ transcriptions-worker-runpod/
     └── smoke_test.sh          # curl against a deployed endpoint
 ```
 
-`handler.py` is thin orchestration only — all model logic lives in `transcribe.py`,
+Root `handler.py` only starts RunPod and delegates to `src.handler`. The worker
+orchestration stays in `src/handler.py`, and all model logic lives in `transcribe.py`,
 which is the only module that imports NeMo/torch.
 
 ---
@@ -190,7 +192,7 @@ The RunPod SDK loads `tests/test_input.json` automatically:
 
 ```bash
 # Tests import the worker without a GPU via the test-only escape hatch:
-SKIP_MODEL_LOAD=1 python src/handler.py
+SKIP_MODEL_LOAD=1 python handler.py
 ```
 
 `tests/test_input.json`:
@@ -202,7 +204,7 @@ SKIP_MODEL_LOAD=1 python src/handler.py
 Or pass input inline (takes precedence over the file):
 
 ```bash
-python src/handler.py --test_input '{"input": {"audio_url": "https://.../clip.wav"}}'
+python handler.py --test_input '{"input": {"audio_url": "https://.../clip.wav"}}'
 ```
 
 > `SKIP_MODEL_LOAD=1` is a **test-only** escape hatch: `transcribe.load_model()` returns
@@ -210,7 +212,7 @@ python src/handler.py --test_input '{"input": {"audio_url": "https://.../clip.wa
 > An actual transcription still needs a real model — never set this in production.
 >
 > Note: `runpod.serverless.progress_update(...)` does **not** deliver in pure-local
-> `python src/handler.py` runs; validate progress under `--rp_serve_api` if you depend on it.
+> `python handler.py` runs; validate progress under `--rp_serve_api` if you depend on it.
 
 ---
 
@@ -220,7 +222,7 @@ The RunPod SDK can expose the handler as a local FastAPI server with the same `/
 and `/status` routes the cloud endpoint provides — handy for running the worker on your own GPU box:
 
 ```bash
-python src/handler.py --rp_serve_api --rp_api_host 0.0.0.0 --rp_api_port 8000
+python handler.py --rp_serve_api --rp_api_host 0.0.0.0 --rp_api_port 8000
 ```
 
 Flags (from the RunPod SDK):
@@ -495,5 +497,5 @@ knowing about:
 
 - [Parakeet TDT 0.6B v2 model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2)
 - [NeMo ASR docs (long audio / local attention)](https://docs.nvidia.com/nemo-framework/user-guide/latest/nemotoolkit/asr/intro.html)
-- [RunPod handler functions](https://docs.runpod.io/serverless/workers/handlers/overview)
+- [RunPod handler functions](https://docs.runpod.io/serverless/workers/handler-functions)
 - [RunPod Python SDK](https://github.com/runpod/runpod-python)

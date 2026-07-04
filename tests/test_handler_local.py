@@ -271,7 +271,7 @@ def test_missing_job_id_does_not_crash(patched_audio, patched_transcribe):
 def test_skip_model_load_kept_module_importable():
     # If the import-time load_model() had tried to import NeMo this test file
     # would have failed to import. Reaching here proves the escape hatch works.
-    assert config.SKIP_MODEL_LOAD is True
+    assert transcribe._skip_model_load() is True
     assert callable(handler.handler)
 
 

@@ -71,8 +71,9 @@ RUN python3 prefetch_model.py
 # Application code. Keep the SPEC §8.1 layout: src/ stays a package directory
 # under /app (NOT flattened) so the handler's `from src import ...` resolves.
 COPY src/ ./src/
+COPY handler.py .
 COPY tests/test_input.json .
 
-# RunPod entrypoint. handler.py inserts the repo root (/app) onto sys.path so
-# `from src import ...` works when invoked as `python3 src/handler.py`.
-CMD ["python3", "-u", "src/handler.py"]
+# RunPod entrypoint. The repository-root wrapper exposes the conventional
+# `runpod.serverless.start(...)` marker while delegating to src.handler.
+CMD ["python3", "-u", "handler.py"]

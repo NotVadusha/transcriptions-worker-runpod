@@ -51,6 +51,12 @@ _default_self_attention: str | None = None
 _default_att_context_size: list | None = None
 
 
+def _skip_model_load() -> bool:
+    """Return whether the test-only model-load escape hatch is enabled."""
+    raw = os.environ.get("SKIP_MODEL_LOAD", "")
+    return config.SKIP_MODEL_LOAD or raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class TranscriptionError(Exception):
     """Raised on unexpected inference failure (SPEC §3.3 TRANSCRIPTION_FAILED).
 
@@ -71,7 +77,7 @@ class TranscriptionError(Exception):
 def load_model() -> None:
     """Load the NeMo ASR model once. Idempotent.
 
-    If ``config.SKIP_MODEL_LOAD`` is truthy (TEST-ONLY escape hatch) this
+    If ``SKIP_MODEL_LOAD`` is truthy (TEST-ONLY escape hatch) this
     returns immediately WITHOUT importing NeMo/torch, so the module is usable on
     a machine with no GPU. Otherwise it imports NeMo + torch lazily, loads the
     pretrained model, switches it to eval mode, and sets the cuDNN benchmark
@@ -86,7 +92,7 @@ def load_model() -> None:
         return
 
     # TEST-ONLY: skip NeMo/torch entirely. Must be checked BEFORE importing nemo.
-    if config.SKIP_MODEL_LOAD:
+    if _skip_model_load():
         return
 
     # Lazy, GPU-only imports — kept inside the function on purpose.
@@ -138,7 +144,7 @@ def _set_attention(mode: str) -> None:
     if _attention_mode == mode:
         return
 
-    if config.SKIP_MODEL_LOAD or _model is None:
+    if _skip_model_load() or _model is None:
         # No real model (test mode): just record the requested mode so the
         # bookkeeping stays consistent without touching NeMo.
         _attention_mode = mode
@@ -295,7 +301,7 @@ def run(wav_path: str, duration: float, return_timestamps: bool) -> dict:
     Unexpected inference errors are wrapped in :class:`TranscriptionError`
     (-> job FAILED). Programming/value errors are allowed to propagate.
     """
-    if _model is None and not config.SKIP_MODEL_LOAD:
+    if _model is None and not _skip_model_load():
         # Defensive: the handler loads the model at import. If we get here with
         # no model and not in test mode, something is badly wrong.
         raise TranscriptionError("model is not loaded; call load_model() first.")
