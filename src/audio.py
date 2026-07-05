@@ -1,24 +1,34 @@
-"""Audio download and preprocessing (SPEC §4).
+"""Audio input streaming and preprocessing (SPEC §4).
+
+The input audio is a caller-supplied presigned HTTPS GET URL. Rather than
+downloading it to disk first, ``ffprobe``/``ffmpeg`` read the URL DIRECTLY and
+stream it — so the only file we ever write is the normalized WAV (and its
+per-chunk windows), never a copy of the raw upload.
 
 Responsibilities:
-  * Download a presigned HTTPS audio URL to a per-job temp dir (streamed to
-    disk, size-capped, timeout-bounded).
-  * Probe the source duration with ``ffprobe`` (the trusted duration, used for
-    the ``AUDIO_TOO_LONG`` gate and ``meta.audio_duration_sec``).
-  * Normalize arbitrary input to 16 kHz mono 16-bit PCM WAV with ``ffmpeg``
-    (Parakeet expects 16 kHz mono).
+  * Probe the source duration with ``ffprobe`` reading the URL (the trusted
+    duration, used for the ``AUDIO_TOO_LONG`` gate and ``meta.audio_duration_sec``).
+  * Normalize the streamed input to 16 kHz mono 16-bit PCM WAV with ``ffmpeg``
+    reading the URL (Parakeet expects 16 kHz mono). Video inputs work too —
+    ``-vn`` keeps only the audio stream, so ffmpeg does the demux/extract.
   * Extract per-chunk windows from the normalized WAV for the long-audio path.
 
-This module uses ``httpx`` (HTTP) and ``ffmpeg``/``ffprobe`` (subprocess). It
-does NOT import torch/nemo, so it can be imported and unit-tested (with those
-two dependencies mocked) on a GPU-free machine.
+This module shells out to ``ffmpeg``/``ffprobe`` (subprocess) and does NOT import
+torch/nemo, so it can be imported and unit-tested (with the subprocess mocked)
+on a GPU-free machine.
+
+Security tradeoff (SPEC §10): streaming with ffmpeg means we no longer enforce a
+download byte-cap and ffmpeg may follow HTTP redirects, so the previous
+httpx-based size-cap + no-redirect SSRF guard is gone. The ``AUDIO_TOO_LONG``
+duration gate (``ffprobe`` runs first) is the remaining resource bound, and the
+caller is trusted to pass a direct https presigned S3 URL (README "Security
+model"). ``-rw_timeout`` bounds a stalled network read.
 
 Error mapping (SPEC §3.3):
-  * Download problems (non-2xx, timeout, connection error, size cap exceeded)
-    -> :class:`DownloadError` (code ``DOWNLOAD_FAILED``).
+  * A network/HTTP failure fetching the URL (probe or stream) ->
+    :class:`DownloadError` (code ``DOWNLOAD_FAILED``).
   * ffmpeg *decode* failure during normalization -> :class:`FFmpegError` with
-    code ``UNSUPPORTED_FORMAT`` (a non-zero normalize exit almost always means
-    the input container/codec could not be decoded).
+    code ``UNSUPPORTED_FORMAT`` (the input container/codec could not be decoded).
   * Any other ffmpeg/ffprobe failure -> :class:`FFmpegError` with code
     ``FFMPEG_FAILED``.
 """
@@ -29,8 +39,6 @@ import os
 import shutil
 import subprocess
 import tempfile
-
-import httpx
 
 from src import config
 from src.config import ErrorCode
@@ -56,7 +64,11 @@ class AudioError(Exception):
 
 
 class DownloadError(AudioError):
-    """Raised when the audio download fails (code ``DOWNLOAD_FAILED``)."""
+    """Raised when the audio URL can't be fetched/streamed (code ``DOWNLOAD_FAILED``).
+
+    Covers ffprobe/ffmpeg network failures reading the presigned URL: HTTP 4xx/5xx,
+    TLS errors, DNS failures, connection refused/reset, or an ``-rw_timeout`` stall.
+    """
 
     def __init__(self, message: str, code: str = ErrorCode.DOWNLOAD_FAILED) -> None:
         super().__init__(message, code)
@@ -94,85 +106,81 @@ def cleanup(work_dir: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Download
-# --------------------------------------------------------------------------- #
-def download(audio_url: str, work_dir: str) -> str:
-    """Stream ``audio_url`` to disk inside ``work_dir`` and return the path.
-
-    Enforces ``config.DOWNLOAD_TIMEOUT_SEC`` and aborts with
-    :class:`DownloadError` on a non-2xx response, a network/timeout error, or
-    when more than ``config.MAX_DOWNLOAD_BYTES`` have been received. The body is
-    streamed chunk-by-chunk so a large file is never loaded fully into memory,
-    and the size cap is checked mid-stream so we stop early rather than after a
-    multi-GB download completes.
-
-    The downloaded file is named ``source_audio`` (no extension): we never trust
-    the extension — ffmpeg is the format arbiter (SPEC §4).
-    """
-    dest_path = os.path.join(work_dir, "source_audio")
-    max_bytes = config.MAX_DOWNLOAD_BYTES
-    timeout = config.DOWNLOAD_TIMEOUT_SEC
-
-    try:
-        # follow_redirects=False on purpose. SPEC §1 guarantees a plain GET on
-        # the presigned URL is sufficient, so redirects are not needed — and not
-        # chasing them closes an SSRF vector: a presigned host that 30x-redirects
-        # to a loopback / link-local / cloud-metadata (169.254.169.254) address
-        # is never followed, and the https-only contract (§3.1) cannot be
-        # silently bypassed on a redirect hop. A 3xx therefore surfaces as a
-        # clean DOWNLOAD_FAILED below rather than being chased.
-        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-            with client.stream("GET", audio_url) as response:
-                if response.status_code < 200 or response.status_code >= 300:
-                    raise DownloadError(
-                        f"Download failed: server returned HTTP "
-                        f"{response.status_code}."
-                    )
-
-                # Fast-fail on an advertised over-size body before streaming any
-                # of it. The mid-stream cap below remains the authoritative guard
-                # for a missing or dishonest Content-Length.
-                declared = response.headers.get("Content-Length")
-                if declared is not None:
-                    try:
-                        declared_bytes = int(declared)
-                    except ValueError:
-                        declared_bytes = None
-                    if declared_bytes is not None and declared_bytes > max_bytes:
-                        raise DownloadError(
-                            f"Download aborted: Content-Length {declared_bytes} "
-                            f"exceeds the maximum allowed size of {max_bytes} bytes."
-                        )
-
-                bytes_written = 0
-                with open(dest_path, "wb") as fh:
-                    for chunk in response.iter_bytes():
-                        if not chunk:
-                            continue
-                        bytes_written += len(chunk)
-                        if bytes_written > max_bytes:
-                            # Abort early — don't finish a huge download.
-                            raise DownloadError(
-                                f"Download aborted: audio exceeds the maximum "
-                                f"allowed size of {max_bytes} bytes."
-                            )
-                        fh.write(chunk)
-    except DownloadError:
-        raise
-    except httpx.TimeoutException as exc:
-        raise DownloadError(
-            f"Download timed out after {timeout}s: {exc}"
-        ) from exc
-    except httpx.HTTPError as exc:
-        # Connection errors, invalid responses, too many redirects, etc.
-        raise DownloadError(f"Download failed: {exc}") from exc
-
-    return dest_path
-
-
-# --------------------------------------------------------------------------- #
 # ffprobe / ffmpeg helpers
 # --------------------------------------------------------------------------- #
+# Substrings that mark an ffmpeg/ffprobe failure as a network/HTTP problem
+# (fetching the URL) rather than a decode problem (a bad file). Lowercased match.
+_NETWORK_ERROR_MARKERS = (
+    "http error",
+    "server returned",
+    "403 forbidden",
+    "404 not found",
+    "401 unauthorized",
+    "400 bad request",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "network is unreachable",
+    "failed to resolve",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "timed out",
+    "timeout",  # covers "read timeout" and our own -rw_timeout expiry phrasings
+    "i/o error",
+    "unable to open resource",
+    # TLS/SSL handshake + cert failures (gnutls / openssl). Specific phrases only —
+    # a bare "tls" substring would false-match codec/container names.
+    "error in the pull function",
+    "ssl routines",
+    "ssl handshake",
+    "tls handshake",
+    "certificate",
+)
+
+
+def _is_url(source: str) -> bool:
+    """True if ``source`` is an http(s) URL (vs a local file path)."""
+    return source.startswith("http://") or source.startswith("https://")
+
+
+def _network_input_opts() -> list[str]:
+    """ffmpeg/ffprobe options for robustly streaming a URL input.
+
+    MUST be placed before ``-i``. ``-rw_timeout`` (microseconds) bounds a stalled
+    read; the ``-reconnect*`` flags let ffmpeg resume a dropped/erroring S3 GET
+    instead of failing the whole job:
+      * reconnect / reconnect_streamed  — reconnect at EOF and for non-seekable streams
+      * reconnect_on_network_error      — reconnect on a mid-stream read error; THIS is
+        the one that matters for seekable S3 URLs (reconnect_streamed does not cover
+        a mid-transfer TCP/TLS drop on a seekable source). Needs ffmpeg >= 4.3.
+      * reconnect_on_http_error 5xx     — retry transient S3 5xx (503/504 throttling)
+    MUST-VALIDATE-IN-CONTAINER: confirm the image's ffmpeg accepts these
+    (`ffmpeg -h full | grep reconnect`) — an unknown option fails every job.
+    # ponytail: -rw_timeout is per-read only; no total deadline (SPEC §10, trusted caller).
+    """
+    timeout_usec = max(1, config.DOWNLOAD_TIMEOUT_SEC) * 1_000_000
+    return [
+        "-rw_timeout",
+        str(timeout_usec),
+        "-reconnect",
+        "1",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_on_http_error",
+        "5xx",
+        "-reconnect_delay_max",
+        "30",
+    ]
+
+
+def _looks_like_network_error(stderr: str) -> bool:
+    """Heuristic: does this ffmpeg/ffprobe stderr describe a fetch failure?"""
+    low = (stderr or "").lower()
+    return any(marker in low for marker in _NETWORK_ERROR_MARKERS)
+
+
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     """Run ``cmd`` capturing stdout/stderr as text. Never raises on non-zero.
 
@@ -188,21 +196,23 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def probe_duration(path: str) -> float:
+def probe_duration(source: str) -> float:
     """Return the audio duration in seconds via ``ffprobe``.
 
-    Raises :class:`FFmpegError` (code ``FFMPEG_FAILED``) if ffprobe fails or its
-    output cannot be parsed as a positive float.
+    ``source`` may be a presigned URL (read/streamed directly) or a local path.
+    Raises :class:`DownloadError` (``DOWNLOAD_FAILED``) if a URL can't be fetched,
+    or :class:`FFmpegError` (``FFMPEG_FAILED``) if ffprobe fails or its output
+    cannot be parsed as a positive float.
     """
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
+    cmd = ["ffprobe", "-v", "error"]
+    if _is_url(source):
+        cmd += _network_input_opts()
+    cmd += [
         "-show_entries",
         "format=duration",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        path,
+        source,
     ]
     try:
         proc = _run(cmd)
@@ -212,6 +222,10 @@ def probe_duration(path: str) -> float:
         ) from exc
 
     if proc.returncode != 0:
+        if _is_url(source) and _looks_like_network_error(proc.stderr):
+            raise DownloadError(
+                f"Could not read audio from URL: {proc.stderr.strip()}"
+            )
         raise FFmpegError(
             f"ffprobe failed to read duration: {proc.stderr.strip()}",
             ErrorCode.FFMPEG_FAILED,
@@ -235,25 +249,28 @@ def probe_duration(path: str) -> float:
     return duration
 
 
-def normalize(src_path: str, work_dir: str) -> str:
-    """Normalize ``src_path`` to 16 kHz mono 16-bit PCM WAV; return its path.
+def normalize(source: str, work_dir: str) -> str:
+    """Normalize ``source`` to 16 kHz mono 16-bit PCM WAV; return its path.
 
-    Runs (SPEC §4)::
+    ``source`` may be a presigned URL (streamed directly by ffmpeg) or a local
+    path. Runs (SPEC §4)::
 
-        ffmpeg -nostdin -y -i <src> -ac 1 -ar 16000 -vn -c:a pcm_s16le \
-            <work_dir>/audio_16khz_mono.wav
+        ffmpeg -nostdin -y [net opts if URL] -i <source> \
+            -ac 1 -ar 16000 -vn -c:a pcm_s16le <work_dir>/audio_16khz_mono.wav
 
-    A non-zero exit is mapped to ``UNSUPPORTED_FORMAT`` — the common cause is an
-    input container/codec ffmpeg cannot decode. We deliberately do not
-    pre-filter by extension; ffmpeg is the arbiter of what is decodable.
+    ``-vn`` drops any video stream, so a video URL is transparently demuxed to
+    audio. A network fetch failure maps to ``DOWNLOAD_FAILED``; any other
+    non-zero exit maps to ``UNSUPPORTED_FORMAT`` (the container/codec could not
+    be decoded). We deliberately do not pre-filter by extension; ffmpeg is the
+    arbiter of what is decodable.
     """
     out_path = os.path.join(work_dir, "audio_16khz_mono.wav")
-    cmd = [
-        "ffmpeg",
-        "-nostdin",
-        "-y",
+    cmd = ["ffmpeg", "-nostdin", "-y"]
+    if _is_url(source):
+        cmd += _network_input_opts()
+    cmd += [
         "-i",
-        src_path,
+        source,
         "-ac",
         "1",
         "-ar",
@@ -261,6 +278,11 @@ def normalize(src_path: str, work_dir: str) -> str:
         "-vn",
         "-c:a",
         "pcm_s16le",
+        # Defense-in-depth output-length cap (bounds WAV disk even if a container
+        # lies about its duration). A legitimate file already passed the ffprobe
+        # AUDIO_TOO_LONG gate, so it is <= MAX_AUDIO_SECONDS and is never truncated.
+        "-t",
+        str(config.MAX_AUDIO_SECONDS),
         out_path,
     ]
     try:
@@ -272,6 +294,10 @@ def normalize(src_path: str, work_dir: str) -> str:
         ) from exc
 
     if proc.returncode != 0:
+        if _is_url(source) and _looks_like_network_error(proc.stderr):
+            raise DownloadError(
+                f"Could not stream audio from URL: {proc.stderr.strip()}"
+            )
         raise FFmpegError(
             f"ffmpeg could not decode the audio (unsupported format): "
             f"{proc.stderr.strip()}",

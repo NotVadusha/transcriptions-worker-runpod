@@ -96,9 +96,22 @@ def test_language_en_ok():
     assert req.language == "en"
 
 
-def test_unsupported_language_raises():
+@pytest.mark.parametrize("code", ["fr", "de", "ja", "zh", "xx"])
+def test_other_languages_now_accepted(code):
+    # Any language routes to a backend now (Whisper is the catch-all).
+    req = parse_request({"audio_url": "https://x.com/a.wav", "language": code})
+    assert req.language == code
+
+
+def test_language_normalized_to_lower_stripped():
+    req = parse_request({"audio_url": "https://x.com/a.wav", "language": "  DE "})
+    assert req.language == "de"
+
+
+@pytest.mark.parametrize("bad", [123, "", "   ", [], {}])
+def test_non_string_or_empty_language_raises(bad):
     with pytest.raises(ValidationError) as exc:
-        parse_request({"audio_url": "https://x.com/a.wav", "language": "fr"})
+        parse_request({"audio_url": "https://x.com/a.wav", "language": bad})
     assert exc.value.code == config.ErrorCode.UNSUPPORTED_LANGUAGE
 
 
@@ -252,3 +265,37 @@ def test_build_output_duration_rounding():
     )
     assert out["meta"]["audio_duration_sec"] == 123.457
     assert out["meta"]["processing_time_sec"] == 8.123
+
+
+def test_build_output_model_comes_from_result():
+    # transcribe.run stamps the actual backend model on the result; meta reflects it.
+    result = _sample_result()
+    result["model"] = config.CANARY_MODEL
+    req = Request("https://x.com/a.wav", True, "de", None)
+    out = build_output(result, duration=10.0, processing_time=2.0, req=req)
+    assert out["meta"]["model"] == config.CANARY_MODEL
+
+
+# --------------------------------------------------------------------------- #
+# config.route_backend — language -> backend
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "language,backend",
+    [
+        ("en", "parakeet"),
+        ("EN", "parakeet"),  # case-insensitive
+        ("zh", "sensevoice"),
+        ("yue", "sensevoice"),
+        ("ja", "sensevoice"),
+        ("ko", "sensevoice"),
+        ("de", "canary"),
+        ("pt", "canary"),
+        ("ru", "whisper"),  # not explicitly routed -> catch-all
+        ("xx", "whisper"),
+        ("", "whisper"),
+    ],
+)
+def test_route_backend(language, backend):
+    assert config.route_backend(language) == backend
+    # Every routed backend has a model id.
+    assert config.MODEL_FOR_BACKEND[backend]

@@ -48,6 +48,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # ffmpeg (audio normalize/resample) and libsndfile1 (soundfile/librosa backend)
 # are NOT documented as preinstalled in the NeMo image (RESEARCH.md §1, §5.2).
 # Install both explicitly so audio decode/resample never silently fails.
+# NOTE: the worker STREAMS the input straight from the presigned S3 URL
+# (ffmpeg/ffprobe read the https URL directly — no download to disk), so this
+# ffmpeg must have (a) network/https protocol support and (b) the reconnect
+# options used in src/audio.py (`-reconnect_on_network_error`, ffmpeg >= 4.3).
+# Ubuntu 24.04's ffmpeg (6.x) has both; if you swap the base, verify with:
+#   ffmpeg -protocols | grep https ; ffmpeg -h full | grep reconnect
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg libsndfile1 && \
     rm -rf /var/lib/apt/lists/*
@@ -58,13 +64,21 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Bake the model weights into the image so cold starts don't re-download the
-# ~2.4 GB checkpoint on every worker boot (SPEC §8.1). This runs BEFORE src/ is
-# copied, so prefetch_model.py must NOT import from src — it reads MODEL_NAME
-# straight from the environment. Override the model at build time with:
-#   docker build --build-arg MODEL_NAME=... .
+# Bake ALL backend model weights into the image (Parakeet, Canary, Whisper,
+# SenseVoice) so cold starts never re-download on boot (SPEC §8.1). This adds
+# several GB to the image — size the RunPod container disk accordingly. Runs
+# BEFORE src/ is copied, so prefetch_model.py must NOT import from src — it reads
+# the model ids straight from the environment (defaults match src/config.py).
+# Override any model at build time, e.g.:
+#   docker build --build-arg MODEL_NAME=... --build-arg WHISPER_MODEL=... .
 ARG MODEL_NAME=nvidia/parakeet-tdt-0.6b-v2
-ENV MODEL_NAME=${MODEL_NAME}
+ARG CANARY_MODEL=nvidia/canary-1b-v2
+ARG SENSEVOICE_MODEL=FunAudioLLM/SenseVoiceSmall
+ARG WHISPER_MODEL=openai/whisper-large-v3
+ENV MODEL_NAME=${MODEL_NAME} \
+    CANARY_MODEL=${CANARY_MODEL} \
+    SENSEVOICE_MODEL=${SENSEVOICE_MODEL} \
+    WHISPER_MODEL=${WHISPER_MODEL}
 COPY scripts/prefetch_model.py .
 RUN python3 prefetch_model.py
 

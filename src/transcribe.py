@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 
-from src import audio, chunking, config
+from src import audio, backends, chunking, config
 
 __all__ = ["TranscriptionError", "load_model", "run"]
 
@@ -380,35 +380,43 @@ def _transcribe_one(wav_path: str) -> tuple[str, list[dict], list[dict]]:
     return text, words, segments
 
 
-def run(wav_path: str, duration: float, return_timestamps: bool) -> dict:
-    """Transcribe ``wav_path`` and return our internal result contract.
+def run(
+    wav_path: str,
+    duration: float,
+    return_timestamps: bool = True,
+    language: str = "en",
+) -> dict:
+    """Transcribe ``wav_path`` with the backend that serves ``language``.
 
-    Returns::
+    ``language`` is routed via :func:`config.route_backend`: English -> Parakeet
+    (this module), Asian langs -> SenseVoice, listed EU langs -> Canary, and
+    everything else -> Whisper (all three in :mod:`src.backends`). The result
+    dict is the internal contract used by ``schemas.build_output``::
 
-        {
-            "text": str,
-            "words": list[{start, end, word}],     # absolute-time seconds
-            "segments": list[{start, end, text}],  # absolute-time seconds
-            "chunked": bool,
-            "num_chunks": int,
-        }
+        {"text", "words", "segments", "chunked", "num_chunks", "model"[, ...]}
 
-    Path selection (SPEC §5):
-      * ``duration <= config.SINGLE_PASS_MAX_SEC`` -> single pass with global
-        attention.
-      * otherwise -> chunked path: global attention for manageable chunks, or
-        local attention for larger chunks, plus overlapping windows extracted
-        with ffmpeg, each transcribed with chunk-local timestamps, then stitched
-        to absolute time via ``chunking.stitch``. Large internal gaps are
-        retried with a padded extraction window.
+    ``return_timestamps`` does NOT change whether timestamps are computed — the
+    chunked path always needs them; the handler/schemas layer decides what to
+    surface. Unexpected inference errors are wrapped in :class:`TranscriptionError`
+    (-> job FAILED).
+    """
+    backend = config.route_backend(language)
+    if backend == "parakeet":
+        result = _run_parakeet(wav_path, duration)
+    else:
+        result = backends.run(backend, wav_path, duration, language)
+    result["model"] = config.MODEL_FOR_BACKEND[backend]
+    return result
 
-    ``return_timestamps`` does NOT change whether we ask NeMo for timestamps —
-    we always do (the chunked path needs them for overlap dedup, and they are
-    cheap for short audio). The handler/schemas layer decides whether to surface
-    them to the client. We return words/segments here unconditionally.
 
-    Unexpected inference errors are wrapped in :class:`TranscriptionError`
-    (-> job FAILED). Programming/value errors are allowed to propagate.
+def _run_parakeet(wav_path: str, duration: float) -> dict:
+    """Parakeet TDT path (SPEC §5): single-pass or chunked with attention switching.
+
+    * ``duration <= config.SINGLE_PASS_MAX_SEC`` -> single pass, global attention.
+    * otherwise -> overlapping ffmpeg-extracted chunks (global attention for
+      manageable chunks, local attention for larger ones), each transcribed with
+      chunk-local timestamps, stitched to absolute time via ``chunking.stitch``,
+      then large internal gaps are retried with a padded extraction window.
     """
     if _model is None and not _skip_model_load():
         # Defensive: the handler loads the model at import. If we get here with

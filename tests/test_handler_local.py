@@ -55,20 +55,16 @@ def patched_audio(monkeypatch, tmp_path):
     def fake_make_workdir(job_id):
         return workdir
 
-    def fake_download(audio_url, work_dir):
-        return os.path.join(work_dir, "source_audio")
-
-    def fake_probe_duration(path):
+    def fake_probe_duration(source):
         return state["duration"]
 
-    def fake_normalize(src_path, work_dir):
+    def fake_normalize(source, work_dir):
         return os.path.join(work_dir, "audio_16khz_mono.wav")
 
     def fake_cleanup(work_dir):
         state["cleanup_called"] = True
 
     monkeypatch.setattr(audio, "make_workdir", fake_make_workdir)
-    monkeypatch.setattr(audio, "download", fake_download)
     monkeypatch.setattr(audio, "probe_duration", fake_probe_duration)
     monkeypatch.setattr(audio, "normalize", fake_normalize)
     monkeypatch.setattr(audio, "cleanup", fake_cleanup)
@@ -80,10 +76,11 @@ def patched_transcribe(monkeypatch):
     """Stub transcribe.run to return a canned result (no NeMo)."""
     calls = {}
 
-    def fake_run(wav_path, duration, return_timestamps):
+    def fake_run(wav_path, duration, return_timestamps=True, language="en"):
         calls["wav_path"] = wav_path
         calls["duration"] = duration
         calls["return_timestamps"] = return_timestamps
+        calls["language"] = language
         return _fake_result()
 
     monkeypatch.setattr(transcribe, "run", fake_run)
@@ -104,11 +101,21 @@ def test_non_https_audio_url_returns_invalid_url(patched_audio):
     assert out["error"]["code"] == config.ErrorCode.INVALID_URL
 
 
-def test_unsupported_language_returns_structured_error(patched_audio):
+def test_non_string_language_returns_structured_error(patched_audio):
+    # A non-string language is the only language validation failure now; real
+    # codes (fr/de/ja/...) are all routed to a backend.
     out = handler.handler(
-        _job({"audio_url": "https://x.com/a.wav", "language": "fr"})
+        _job({"audio_url": "https://x.com/a.wav", "language": 123})
     )
     assert out["error"]["code"] == config.ErrorCode.UNSUPPORTED_LANGUAGE
+
+
+def test_routed_language_passed_through_to_transcribe(patched_audio, patched_transcribe):
+    out = handler.handler(
+        _job({"audio_url": "https://x.com/a.wav", "language": "de"})
+    )
+    assert "error" not in out
+    assert patched_transcribe["language"] == "de"
 
 
 def test_validation_error_does_not_create_or_clean_workdir(monkeypatch):
@@ -151,10 +158,12 @@ def test_audio_at_limit_is_allowed(patched_audio, patched_transcribe):
 def test_download_error_maps_to_structured_code(
     monkeypatch, patched_audio, patched_transcribe
 ):
-    def boom(audio_url, work_dir):
+    # A URL fetch failure now surfaces from ffprobe/ffmpeg as DownloadError; the
+    # streamed probe runs first, so simulate it there.
+    def boom(source):
         raise audio.DownloadError("server returned HTTP 404.")
 
-    monkeypatch.setattr(audio, "download", boom)
+    monkeypatch.setattr(audio, "probe_duration", boom)
     out = handler.handler(_job({"audio_url": "https://x.com/a.wav"}))
     assert out["error"]["code"] == config.ErrorCode.DOWNLOAD_FAILED
     assert "404" in out["error"]["message"]
@@ -188,7 +197,7 @@ def test_ffmpeg_probe_failure_maps_to_structured_code(
 # TranscriptionError -> re-raised (job FAILED), cleanup still runs
 # --------------------------------------------------------------------------- #
 def test_transcription_error_is_reraised(monkeypatch, patched_audio):
-    def boom(wav_path, duration, return_timestamps):
+    def boom(wav_path, duration, return_timestamps=True, language="en"):
         raise transcribe.TranscriptionError("inference blew up")
 
     monkeypatch.setattr(transcribe, "run", boom)

@@ -76,7 +76,14 @@ def _get_bool(name: str, default: bool) -> bool:
 # --------------------------------------------------------------------------- #
 # Model / language
 # --------------------------------------------------------------------------- #
-MODEL_NAME: str = _get_str("MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
+# Per-backend model checkpoints. Language routing (below) picks one per request.
+PARAKEET_MODEL: str = _get_str("MODEL_NAME", "nvidia/parakeet-tdt-0.6b-v2")
+CANARY_MODEL: str = _get_str("CANARY_MODEL", "nvidia/canary-1b-v2")
+SENSEVOICE_MODEL: str = _get_str("SENSEVOICE_MODEL", "FunAudioLLM/SenseVoiceSmall")
+WHISPER_MODEL: str = _get_str("WHISPER_MODEL", "openai/whisper-large-v3")
+
+# Back-compat alias: the default (English) model. prefetch + meta fallback read it.
+MODEL_NAME: str = PARAKEET_MODEL
 TRANSCRIPTION_QUALITY: str = _get_str("TRANSCRIPTION_QUALITY", "balanced").lower()
 if TRANSCRIPTION_QUALITY not in ("fast", "balanced", "best"):
     raise ValueError(
@@ -102,7 +109,36 @@ _QUALITY_DEFAULTS = {
 }[TRANSCRIPTION_QUALITY]
 
 DEFAULT_LANGUAGE: str = "en"
-SUPPORTED_LANGUAGES: frozenset = frozenset({"en"})
+
+# Language -> backend routing.
+#   Parakeet  : English only.
+#   SenseVoice: the Asian languages it officially covers.
+#   Canary    : the listed European languages.
+#   Whisper   : catch-all for every other language.
+PARAKEET_LANGUAGES: frozenset = frozenset({"en"})
+SENSEVOICE_LANGUAGES: frozenset = frozenset({"zh", "yue", "ja", "ko"})
+CANARY_LANGUAGES: frozenset = frozenset(
+    {"de", "fr", "es", "it", "pl", "ro", "da", "sv", "nl", "pt"}
+)
+
+MODEL_FOR_BACKEND: dict = {
+    "parakeet": PARAKEET_MODEL,
+    "canary": CANARY_MODEL,
+    "sensevoice": SENSEVOICE_MODEL,
+    "whisper": WHISPER_MODEL,
+}
+
+
+def route_backend(language: str) -> str:
+    """Return the backend name serving ``language`` (Whisper is the catch-all)."""
+    lang = (language or "").strip().lower()
+    if lang in PARAKEET_LANGUAGES:
+        return "parakeet"
+    if lang in SENSEVOICE_LANGUAGES:
+        return "sensevoice"
+    if lang in CANARY_LANGUAGES:
+        return "canary"
+    return "whisper"
 
 # --------------------------------------------------------------------------- #
 # Audio / inference limits (seconds)
@@ -121,10 +157,11 @@ GAP_RETRY_ENABLED: bool = _get_bool(
 )
 
 # --------------------------------------------------------------------------- #
-# Download limits
+# Input streaming (ffmpeg/ffprobe read the presigned URL directly)
 # --------------------------------------------------------------------------- #
+# Bounds a stalled network read when streaming the input URL — passed to
+# ffmpeg/ffprobe as -rw_timeout (converted to microseconds). Not a total deadline.
 DOWNLOAD_TIMEOUT_SEC: int = _get_int("DOWNLOAD_TIMEOUT_SEC", 120)
-MAX_DOWNLOAD_BYTES: int = _get_int("MAX_DOWNLOAD_BYTES", 2147483648)
 
 # --------------------------------------------------------------------------- #
 # Result offload (RunPod payload limits)
