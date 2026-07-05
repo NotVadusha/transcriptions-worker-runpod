@@ -5,8 +5,9 @@ Responsibilities, in order, for a single job:
   1. Parse/validate the request (``schemas.parse_request``) — caller errors
      return a structured ``{"error": {...}}`` object (job SUCCEEDED with an
      error payload, per SPEC §3.3 caller-error semantics).
-  2. Download the audio, probe its duration, gate on ``MAX_AUDIO_SECONDS``,
-     normalize to 16 kHz mono WAV (``audio`` module).
+  2. Probe the presigned URL's duration (streamed by ffprobe), gate on
+     ``MAX_AUDIO_SECONDS``, then normalize to 16 kHz mono WAV with ffmpeg reading
+     the URL directly — no raw download to disk (``audio`` module).
   3. Transcribe (``transcribe.run``) and build the §3.2 output
      (``schemas.build_output``).
   4. Offload the result if it is too large to return inline
@@ -15,7 +16,7 @@ Responsibilities, in order, for a single job:
 Error handling:
   * ``schemas.ValidationError``        -> structured error (caller error).
   * ``AUDIO_TOO_LONG``                 -> structured error (caller error).
-  * ``audio.AudioError`` (download /   -> structured error using ``e.code``
+  * ``audio.AudioError`` (URL fetch /  -> structured error using ``e.code``
     ffmpeg / unsupported format)          (covers DOWNLOAD_FAILED,
                                            FFMPEG_FAILED, UNSUPPORTED_FORMAT).
   * ``transcribe.TranscriptionError``  -> re-raised so RunPod marks the job
@@ -76,10 +77,9 @@ def handler(job) -> dict:
 
     work_dir = audio.make_workdir(job.get("id", "unknown"))
     try:
-        _progress(job, "Downloading audio")
-        src_path = audio.download(req.audio_url, work_dir)
-
-        duration = audio.probe_duration(src_path)
+        # ffprobe reads the presigned URL directly (streamed) — no download step.
+        _progress(job, "Probing audio")
+        duration = audio.probe_duration(req.audio_url)
         if duration > config.MAX_AUDIO_SECONDS:
             return {
                 "error": {
@@ -91,13 +91,17 @@ def handler(job) -> dict:
                 }
             }
 
-        _progress(job, "Normalizing audio")
-        wav_path = audio.normalize(src_path, work_dir)
+        # ffmpeg streams the presigned URL and writes only the normalized WAV.
+        _progress(job, "Streaming and normalizing audio")
+        wav_path = audio.normalize(req.audio_url, work_dir)
 
         _progress(job, "Transcribing")
         t0 = time.perf_counter()
         result = transcribe.run(
-            wav_path, duration, return_timestamps=req.return_timestamps
+            wav_path,
+            duration,
+            return_timestamps=req.return_timestamps,
+            language=req.language,
         )
         proc = time.perf_counter() - t0
 

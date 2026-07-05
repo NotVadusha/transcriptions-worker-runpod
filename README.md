@@ -7,8 +7,9 @@ toolkit) and returns transcript text plus word- and segment-level timestamps.
 - **Input:** a presigned HTTPS URL to an audio/video file.
 - **Output:** transcript `text`, optional `segments`/`words` timestamps, and run `meta`.
 - **Range:** a few seconds up to **10 hours** of audio. Short clips run in a single pass;
-  long files use a local-attention + overlapping-chunk path with timestamp stitching.
-- **English-only, batch (non-streaming)** for v0. No diarization, no multilingual, no auth/billing.
+  long files use an overlapping-chunk path with timestamp stitching.
+- **Multilingual, batch (non-streaming).** The `language` code routes to one of four
+  backends (see [Model routing](#model-routing)). No diarization, no auth/billing.
 
 The worker stores **no cloud credentials**. It pulls audio from a caller-provided presigned
 GET URL and, for large results, PUTs them to a caller-provided presigned PUT URL.
@@ -29,8 +30,9 @@ transcriptions-worker-runpod/
 ├── src/
 │   ├── __init__.py            # makes `from src import ...` work
 │   ├── handler.py             # worker orchestration implementation
-│   ├── transcribe.py          # NeMo model load + transcription (single-pass & chunked)
-│   ├── audio.py               # download + ffmpeg normalize + ffprobe duration
+│   ├── transcribe.py          # language routing + Parakeet path (single-pass & chunked)
+│   ├── backends.py            # Canary / SenseVoice / Whisper backends (lazy per-language)
+│   ├── audio.py               # stream input URL via ffmpeg/ffprobe + normalize
 │   ├── chunking.py            # long-audio segmentation + timestamp stitching (pure logic)
 │   ├── schemas.py             # request parsing/validation + output building
 │   ├── storage.py             # offload large results to a presigned PUT URL
@@ -50,8 +52,9 @@ transcriptions-worker-runpod/
 ```
 
 Root `handler.py` only starts RunPod and delegates to `src.handler`. The worker
-orchestration stays in `src/handler.py`, and all model logic lives in `transcribe.py`,
-which is the only module that imports NeMo/torch.
+orchestration stays in `src/handler.py`; model logic lives in `transcribe.py` (routing +
+Parakeet) and `backends.py` (Canary/SenseVoice/Whisper) — the only modules that import
+NeMo/torch/funasr/transformers, all via lazy in-function imports.
 
 ---
 
@@ -183,7 +186,7 @@ pytest                 # pyproject.toml sets pythonpath=["."] so `from src impor
 ```
 
 These cover request validation, output shaping, chunk planning, timestamp offset/stitch math,
-download/ffmpeg error mapping, and result-offload behavior — i.e. acceptance criteria that don't
+URL-streaming/ffmpeg error mapping, and result-offload behavior — i.e. acceptance criteria that don't
 need a model.
 
 ### Running the handler locally
@@ -294,7 +297,7 @@ finishes.
 {
   "audio_url": "https://...",          // REQUIRED. Presigned HTTPS GET URL to the audio file.
   "return_timestamps": true,           // OPTIONAL, default true. If false, omit segments & words.
-  "language": "en",                    // OPTIONAL, default "en". v0 accepts only "en".
+  "language": "en",                    // OPTIONAL, default "en". ISO code; routes to a backend.
   "result_upload_url": "https://..."   // OPTIONAL. Presigned HTTPS PUT URL for large-result offload.
 }
 ```
@@ -306,8 +309,11 @@ Validation rules (see `schemas.parse_request`):
 | `audio_url` missing / not a string | error `MISSING_AUDIO_URL` |
 | `audio_url` scheme not `https` (or empty host) | error `INVALID_URL` |
 | `return_timestamps` not a boolean | coerced to `true` (does **not** fail) |
-| `language` present and not in supported set (`{"en"}`) | error `UNSUPPORTED_LANGUAGE` |
+| `language` present but not a non-empty string | error `UNSUPPORTED_LANGUAGE` |
 | `result_upload_url` present and not an `https` URL | error `INVALID_URL` |
+
+Any non-empty language code is accepted and routed to a backend (Whisper is the catch-all),
+so real ISO codes never fail validation. See [Model routing](#model-routing).
 
 ### Success response (inline)
 
@@ -392,9 +398,9 @@ Genuinely unexpected failures (e.g. CUDA OOM, model load failure → `Transcript
 |---|---|
 | `MISSING_AUDIO_URL` | `audio_url` missing or not a string |
 | `INVALID_URL` | `audio_url` or `result_upload_url` not a valid `https` URL |
-| `DOWNLOAD_FAILED` | download non-2xx, timeout, connection error, or over `MAX_DOWNLOAD_BYTES` |
+| `DOWNLOAD_FAILED` | ffmpeg/ffprobe can't fetch the audio URL: HTTP 4xx/5xx, TLS, DNS, connection error, or `-rw_timeout` stall |
 | `UNSUPPORTED_FORMAT` | ffmpeg cannot decode the input (normalize failed) |
-| `UNSUPPORTED_LANGUAGE` | `language` other than `en` in v0 |
+| `UNSUPPORTED_LANGUAGE` | `language` present but not a non-empty string |
 | `AUDIO_TOO_LONG` | probed duration exceeds `MAX_AUDIO_SECONDS` (default 10 h) |
 | `FFMPEG_FAILED` | ffprobe/ffmpeg failed for a non-decode reason (e.g. window extraction) |
 | `TRANSCRIPTION_FAILED` | inference error — **raised**, job marked `FAILED` |
@@ -406,6 +412,29 @@ Genuinely unexpected failures (e.g. CUDA OOM, model load failure → `Transcript
 > large/long audio you **must** pass a presigned PUT URL.
 
 ---
+
+## Model routing
+
+The `language` code selects the transcription backend. Each model is loaded **lazily on
+first use** for its language and kept warm for the life of the worker (a worker that only
+sees English never loads the other three). All weights are baked into the image at build
+time (`scripts/prefetch_model.py`), so the first request for a language pays no download.
+
+| Language(s) | Backend | Model |
+|---|---|---|
+| `en` | Parakeet (NeMo) | `nvidia/parakeet-tdt-0.6b-v2` |
+| `zh`, `yue`, `ja`, `ko` | SenseVoice (FunASR) | `FunAudioLLM/SenseVoiceSmall` |
+| `de`, `fr`, `es`, `it`, `pl`, `ro`, `da`, `sv`, `nl`, `pt` | Canary (NeMo) | `nvidia/canary-1b-v2` |
+| everything else | Whisper (transformers) | `openai/whisper-large-v3` |
+
+`meta.model` in the response reports the model actually used. Notes:
+
+- Only the **Parakeet** path uses the attention-switching + gap-retry long-audio machinery.
+  The other three reuse the same overlapping-chunk planner/stitcher but without gap-retry.
+- **SenseVoice** returns text only (no word timestamps): `words` is empty and `segments`
+  are whole-chunk. Word/segment timestamps come from Parakeet, Canary, and Whisper.
+- The exact model call signatures (Canary `source_lang`/`target_lang`, SenseVoice/Whisper
+  kwargs) are **MUST-VALIDATE-ON-GPU** — coded from the model cards, not yet run on a GPU.
 
 ## How long audio is handled
 
@@ -438,7 +467,10 @@ immediately (fail fast).
 
 | Var | Default | Meaning |
 |---|---|---|
-| `MODEL_NAME` | `nvidia/parakeet-tdt-0.6b-v2` | Model to load. Only v2 is validated in v0. |
+| `MODEL_NAME` | `nvidia/parakeet-tdt-0.6b-v2` | English/Parakeet checkpoint. |
+| `CANARY_MODEL` | `nvidia/canary-1b-v2` | Checkpoint for the listed EU languages. |
+| `SENSEVOICE_MODEL` | `FunAudioLLM/SenseVoiceSmall` | Checkpoint for `zh`/`yue`/`ja`/`ko`. |
+| `WHISPER_MODEL` | `openai/whisper-large-v3` | Catch-all checkpoint for all other languages. |
 | `TRANSCRIPTION_QUALITY` | `balanced` | Preset for long-audio quality/speed. `fast` = old 20-min local-attention chunks, no gap retry. `balanced` = 5-min global-attention chunks + gap retry. `best` = 3-min global-attention chunks + gap retry. Explicit chunk/retry env vars override the preset defaults. |
 | `MAX_AUDIO_SECONDS` | `36000` | Reject audio longer than this (10 h) → `AUDIO_TOO_LONG`. |
 | `SINGLE_PASS_MAX_SEC` | `1440` | `<=` this → single-pass; above → chunked (24 min). |
@@ -448,8 +480,7 @@ immediately (fail fast).
 | `GAP_RETRY_MIN_SEC` | `20` | Minimum timestamp gap that triggers a retry. |
 | `GAP_RETRY_PADDING_SEC` | `5` | Seconds of context added before/after each retried gap. |
 | `GAP_RETRY_MAX_SEC` | `300` | Skip retry windows larger than this to avoid runaway recovery jobs. |
-| `DOWNLOAD_TIMEOUT_SEC` | `120` | Per-download timeout. |
-| `MAX_DOWNLOAD_BYTES` | `2147483648` | Max audio download size (2 GB) → `DOWNLOAD_FAILED` if exceeded. |
+| `DOWNLOAD_TIMEOUT_SEC` | `120` | ffmpeg/ffprobe network read timeout when streaming the input URL (passed as `-rw_timeout`, converted to µs). Not a total deadline. |
 | `RESULT_OFFLOAD_THRESHOLD_BYTES` | `8000000` | Offload result above ~8 MB (under the 10 MB `/run` cap). |
 | `RESULT_UPLOAD_TIMEOUT_SEC` | `120` | Timeout for the PUT to `result_upload_url`. |
 | `SKIP_MODEL_LOAD` | `false` | **Test-only.** Skip NeMo/torch import so the handler imports without a GPU. Never set in production. |
@@ -466,26 +497,33 @@ gateway, auth, or billing in front of the worker — those are explicitly out of
 boundary the worker still takes the following precautions, and leaves a few residual risks worth
 knowing about:
 
-- **Caller-supplied URLs.** Both `audio_url` (GET) and `result_upload_url` (PUT) are caller-controlled.
-  Both must be `https` (validated up front), and the worker does **not follow redirects** on either
-  request. A presigned S3/GCS URL resolves directly, so this is sufficient — and not chasing
-  redirects closes an SSRF path: a host that 30x-redirects to a loopback / link-local /
-  cloud-metadata address (e.g. `169.254.169.254`) is never followed, and the https-only rule can't be
-  bypassed on a redirect hop. A redirect surfaces as a clean `DOWNLOAD_FAILED` / `RESULT_UPLOAD_FAILED`.
+- **Caller-supplied URLs.** Both `audio_url` (GET) and `result_upload_url` (PUT) are caller-controlled
+  and must be `https` (validated up front). The **result PUT** goes through `httpx` with
+  `follow_redirects=False`, so a 30x to a loopback / link-local / cloud-metadata address
+  (e.g. `169.254.169.254`) is never chased — a redirect surfaces as a clean `RESULT_UPLOAD_FAILED`.
+  The **audio GET is now streamed directly by ffmpeg/ffprobe** (see below), which *may* follow HTTP
+  redirects and has no download byte-cap — a deliberate tradeoff for zero-copy streaming under the
+  trusted-caller model.
+- **Input streaming (no download to disk).** `ffprobe`/`ffmpeg` read the presigned `audio_url`
+  directly and stream it; the only file written is the normalized WAV. This drops the previous
+  httpx download's `MAX_DOWNLOAD_BYTES` size-cap and no-redirect guard. Remaining bounds: the
+  **`AUDIO_TOO_LONG` duration gate** (`ffprobe` runs first, before the full stream); a **`-t
+  MAX_AUDIO_SECONDS` output cap** on the WAV (so a container that lies about its duration can't
+  blow up disk); and `-rw_timeout` (`DOWNLOAD_TIMEOUT_SEC`) on a stalled read. ffmpeg's
+  `-reconnect_on_network_error` / `-reconnect_on_http_error 5xx` let long streamed jobs survive a
+  transient S3 drop or 503.
 - **No stored credentials.** The worker holds no cloud keys; all object access goes through the
   caller's presigned URLs. Run it with **no attachable instance/cloud-metadata credentials** and, if
   possible, restricted egress, so even a future SSRF gap has nothing to reach.
 - **Presigned signatures are secrets.** They are never logged or returned: `result_url` has its query
   string stripped, and `RESULT_UPLOAD_FAILED` messages report only the object location + an HTTP
   status / exception type, never the signed URL or a raw exception string.
-- **Bounded resource use.** Downloads are size-capped (`MAX_DOWNLOAD_BYTES`, checked against the
-  advertised `Content-Length` *and* mid-stream) and timeout-bounded (`DOWNLOAD_TIMEOUT_SEC`).
-- **Residual risks (v0):** the SSRF guard is "don't follow redirects" rather than a full
-  resolve-and-block-private-ranges check — a caller that passes a direct `https://<internal-host>/`
-  URL is not blocked (it must still present a valid https endpoint). `DOWNLOAD_TIMEOUT_SEC` is
-  per-socket-operation, so a very slow trickle is bounded by the size cap rather than a hard total
-  deadline. If you later expose this worker to untrusted callers, add a redirect/target
-  address-range guard and a total-download deadline.
+- **Residual risks (v0):** the audio input has **no redirect guard and no byte-cap** (ffmpeg streams
+  it); a malicious caller could redirect it or stream an oversized-but-short file. The result-PUT SSRF
+  guard is still "don't follow redirects" rather than a full resolve-and-block-private-ranges check.
+  `-rw_timeout` is per-read, so a very slow trickle within the duration limit is not bounded by a hard
+  total deadline. If you expose this worker to untrusted callers, restore an input byte-cap + redirect
+  guard (e.g. stream via httpx into `ffmpeg -i pipe:0`) and add a total deadline.
 
 ---
 
@@ -498,7 +536,7 @@ knowing about:
 | 3 | `return_timestamps: false` omits `segments` & `words` | `schemas.build_output` (keys omitted) |
 | 4 | ~30-min file via chunked path, `chunked=true`, correctly stitched | `transcribe.run` long path + `chunking.stitch` |
 | 5 | File > `MAX_AUDIO_SECONDS` → `AUDIO_TOO_LONG` | `handler.py` duration gate |
-| 6 | Bad/missing/non-https URL & undecodable file → correct structured error | `schemas.parse_request`, `audio.download`/`normalize`, `handler.py` catches |
+| 6 | Bad/missing/non-https URL & undecodable file → correct structured error | `schemas.parse_request`, `audio.probe_duration`/`normalize`, `handler.py` catches |
 | 7 | Over-threshold output → `result_url` + `offloaded:true`; no URL → `RESULT_TOO_LARGE` | `storage.maybe_offload` |
 | 8 | `meta` fully populated; `rtf` matches definition | `schemas.build_output` |
 | 9 | `test_chunking.py` & `test_schemas.py` pass without a GPU | `pytest` (this repo) |

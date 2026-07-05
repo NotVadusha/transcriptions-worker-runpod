@@ -84,15 +84,19 @@ def parse_request(job_input: dict) -> Request:
     return_timestamps = rt if isinstance(rt, bool) else True
 
     # --- language --------------------------------------------------------- #
-    language = job_input.get("language", config.DEFAULT_LANGUAGE)
+    # Any language is accepted and routed to a backend (Whisper is the catch-all,
+    # see config.route_backend); absent/None defaults to English. Only a
+    # non-string or empty code is rejected.
+    language = job_input.get("language")
     if language is None:
         language = config.DEFAULT_LANGUAGE
-    if language not in config.SUPPORTED_LANGUAGES:
+    elif not isinstance(language, str) or language.strip() == "":
         raise ValidationError(
             config.ErrorCode.UNSUPPORTED_LANGUAGE,
-            f"language {language!r} is not supported; v0 supports only "
-            f"{sorted(config.SUPPORTED_LANGUAGES)}.",
+            "language must be a non-empty language code string (e.g. 'en', 'de').",
         )
+    else:
+        language = language.strip().lower()
 
     # --- result_upload_url ------------------------------------------------ #
     result_upload_url = job_input.get("result_upload_url")
@@ -138,7 +142,9 @@ def build_output(
         output["words"] = result["words"]
 
     output["meta"] = {
-        "model": config.MODEL_NAME,
+        # The actual backend model used for this request (transcribe.run sets it);
+        # falls back to the default English model when absent.
+        "model": result.get("model", config.MODEL_NAME),
         "language": req.language,
         "audio_duration_sec": round(duration, 3),
         "processing_time_sec": round(processing_time, 3),
